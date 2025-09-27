@@ -1,3 +1,4 @@
+// controllers/VictimControllers.js
 const fs = require('fs');
 const path = require('path');
 const Victim = require('../Model/VictimModel');
@@ -25,6 +26,69 @@ function normalizeRiskStatus(input) {
   return undefined; // unknown → let schema default or keep existing
 }
 
+/** Regex helpers */
+const NIC_REGEX = /^(?:\d{12}|\d{9}[VX])$/i;        // old: 9 digits + V/X, new: 12 digits
+const NAME_REGEX = /^[A-Za-z\s]+$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_E164 = /^\+\d{6,15}$/;                  // simple E.164-ish: + plus 6–15 digits
+
+/** Common validation used by POST and PUT (final state check) */
+function validateVictimObject(obj) {
+  const errors = {};
+
+  // Name: required, letters & spaces only
+  if (!obj.name || !String(obj.name).trim()) {
+    errors.name = 'Reporter name is required';
+  } else if (!NAME_REGEX.test(String(obj.name))) {
+    errors.name = 'Name must contain letters and spaces only';
+  }
+
+  // Phone: required, E.164-like (+ + digits)
+  if (!obj.phone || !String(obj.phone).trim()) {
+    errors.phone = 'Phone is required';
+  } else if (!PHONE_E164.test(String(obj.phone).replace(/\s+/g, ''))) {
+    errors.phone = 'Phone must be like +94XXXXXXXXX';
+  }
+
+  // NIC: required, old/new formats
+  if (!obj.nic || !String(obj.nic).trim()) {
+    errors.nic = 'NIC is required';
+  } else if (!NIC_REGEX.test(String(obj.nic))) {
+    errors.nic = 'NIC must be 123456789V or 200012345678';
+  }
+
+  // Status (risk)
+  const norm = normalizeRiskStatus(obj.status);
+  if (!norm) errors.status = 'Status must be High, Medium, or Low';
+
+  // Disaster type
+  if (!obj.disasterType || !String(obj.disasterType).trim()) {
+    errors.disasterType = 'Disaster type is required';
+  }
+
+  // Address
+  if (!obj.address || !String(obj.address).trim()) {
+    errors.address = 'Home address is required';
+  }
+
+  // Location (current location mandatory)
+  const lat = Number(obj?.location?.coordinates?.[1] ?? obj?.lat);
+  const lng = Number(obj?.location?.coordinates?.[0] ?? obj?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    errors.coords = 'Current location (lat & lng) is required';
+  } else {
+    if (lat < -90 || lat > 90) errors.lat = 'Latitude must be between -90 and 90';
+    if (lng < -180 || lng > 180) errors.lng = 'Longitude must be between -180 and 180';
+  }
+
+  // Email (optional)
+  if (obj.email && !EMAIL_REGEX.test(String(obj.email))) {
+    errors.email = 'Invalid email address';
+  }
+
+  return errors;
+}
+
 /**
  * GET /victims
  * Optional query:
@@ -33,10 +97,11 @@ function normalizeRiskStatus(input) {
  *  - page=1
  *  - limit=50
  *  - status=High|Medium|Low|Pending|Approved|Rejected|In-Review (we normalize)
+ *  - disasterType=<string>
  */
 async function getAllVictims(req, res) {
   try {
-    const { near, radius = 0, page = 1, limit = 50, status } = req.query;
+    const { near, radius = 0, page = 1, limit = 50, status, disasterType } = req.query;
 
     const q = {};
 
@@ -44,6 +109,8 @@ async function getAllVictims(req, res) {
     const norm = normalizeRiskStatus(status);
     if (norm) q.status = norm;
     else if (status && ['High','Medium','Low'].includes(status)) q.status = status;
+
+    if (disasterType) q.disasterType = disasterType;
 
     // Geo filter
     if (near && Number(radius) > 0) {
@@ -83,27 +150,57 @@ async function getAllVictims(req, res) {
  * POST /victims
  * multipart/form-data
  * - files in req.files (limited by routes to 2)
- * - body fields: name, age, email, phone, address, description,
- *                status, occurredAt, lat, lng
+ * - body fields: name, nic, email?, phone, address, description?,
+ *                status (risk), disasterType, occurredAt?, lat, lng
  */
 async function addVictims(req, res) {
   try {
-    const {
+    // Extract & normalize inputs
+    let {
       name,
-      age,
+      nic,
       email,
       phone,
       address,
       description,
       status,
+      disasterType,
       occurredAt,
       lat,
       lng
     } = req.body;
 
-    const riskStatus = normalizeRiskStatus(status) || undefined;
+    name = name?.trim();
+    nic = (nic || '').toUpperCase();
+    email = email?.trim();
+    phone = phone?.trim().replace(/\s+/g, '');
+    address = address?.trim();
+    description = description?.trim();
+    disasterType = disasterType?.trim();
 
-    // Normalize uploaded files to media[]
+    const riskStatus = normalizeRiskStatus(status);
+
+    // Location normalized
+    const nlat = Number(lat);
+    const nlng = Number(lng);
+
+    // Prepare object for validation
+    const toValidate = {
+      name, nic, email, phone, address, description,
+      status: riskStatus || status, disasterType,
+      location: Number.isFinite(nlat) && Number.isFinite(nlng)
+        ? { type: 'Point', coordinates: [nlng, nlat] }
+        : undefined,
+      occurredAt
+    };
+
+    // Server-side validation (requireds + formats)
+    const errors = validateVictimObject(toValidate);
+    if (Object.keys(errors).length) {
+      return res.status(400).json({ message: 'Validation failed', errors });
+    }
+
+    // Files → media[]
     const media = (req.files || []).map(f => ({
       filename: f.filename,
       url: fileUrl(req, f.filename),
@@ -119,17 +216,15 @@ async function addVictims(req, res) {
 
     const doc = await Victim.create({
       name,
-      age,
+      nic,
       email,
       phone,
       address,
       description,
-      status: riskStatus, // High/Medium/Low or undefined => schema default
+      status: normalizeRiskStatus(status), // High/Medium/Low
+      disasterType,
       occurredAt: occurredAt ? new Date(occurredAt) : undefined,
-      location:
-        (lat !== undefined && lng !== undefined)
-          ? { type: 'Point', coordinates: [Number(lng), Number(lat)] }
-          : undefined,
+      location: { type: 'Point', coordinates: [nlng, nlat] },
       image,
       media
     });
@@ -156,71 +251,66 @@ async function getVictimById(req, res) {
 /**
  * PUT /victims/:id
  * multipart/form-data allowed for adding more media
+ * Body may include: name, nic, email?, phone, address, description?,
+ *                   status (risk or legacy), disasterType, occurredAt?, lat, lng,
+ *                   remove (JSON array of filenames to remove)
  */
 async function updateVictim(req, res) {
   try {
-    const {
-      name,
-      age,
-      email,
-      phone,
-      address,
-      description,
-      status,
-      occurredAt,
-      lat,
-      lng
-    } = req.body;
-
     const victim = await Victim.findById(req.params.id);
     if (!victim) return res.status(404).json({ message: 'Victim not found' });
 
-    // Update scalar fields if provided
-    if (name !== undefined) victim.name = name;
-    if (age !== undefined) victim.age = age;
-    if (email !== undefined) victim.email = email;
-    if (phone !== undefined) victim.phone = phone;
-    if (address !== undefined) victim.address = address;
-    if (description !== undefined) victim.description = description;
+    // Scalars (only apply if provided)
+    if (req.body.name !== undefined) victim.name = String(req.body.name).trim();
+    if (req.body.nic !== undefined) victim.nic = String(req.body.nic).toUpperCase();
+    if (req.body.email !== undefined) victim.email = String(req.body.email).trim();
+    if (req.body.phone !== undefined) victim.phone = String(req.body.phone).trim().replace(/\s+/g, '');
+    if (req.body.address !== undefined) victim.address = String(req.body.address).trim();
+    if (req.body.description !== undefined) victim.description = String(req.body.description).trim();
+    if (req.body.disasterType !== undefined) victim.disasterType = String(req.body.disasterType).trim();
 
-    const riskStatus = normalizeRiskStatus(status);
-    if (riskStatus) victim.status = riskStatus;
-
-    if (occurredAt !== undefined) {
-      victim.occurredAt = occurredAt ? new Date(occurredAt) : undefined;
+    // Status (normalize)
+    if (req.body.status !== undefined) {
+      const riskStatus = normalizeRiskStatus(req.body.status);
+      if (riskStatus) victim.status = riskStatus;
     }
 
-    if (lat !== undefined && lng !== undefined) {
-      victim.location = {
-        type: 'Point',
-        coordinates: [Number(lng), Number(lat)]
-      };
+    // Occurred at (optional)
+    if (req.body.occurredAt !== undefined) {
+      victim.occurredAt = req.body.occurredAt ? new Date(req.body.occurredAt) : undefined;
     }
-    // … inside updateVictim after we loaded `victim` and before saving:
 
-// Remove selected existing attachments (from EditVictimProfile)
-if (req.body.remove) {
-  try {
-    const list = JSON.parse(req.body.remove); // array of filenames
-    if (Array.isArray(list) && list.length) {
-      const toRemove = new Set(list.filter(Boolean));
-      // delete files from disk
-      victim.media.forEach(m => {
-        if (m && toRemove.has(m.filename)) {
-          const p = path.join(process.cwd(), 'uploads', m.filename);
-          try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch(_) {}
+    // Location (lat/lng optional but required in final validation)
+    if (req.body.lat !== undefined && req.body.lng !== undefined) {
+      const nlat = Number(req.body.lat);
+      const nlng = Number(req.body.lng);
+      victim.location = { type: 'Point', coordinates: [nlng, nlat] };
+    }
+
+    // Remove selected existing attachments
+    if (req.body.remove) {
+      try {
+        const list = JSON.parse(req.body.remove); // array of filenames
+        if (Array.isArray(list) && list.length) {
+          const toRemove = new Set(list.filter(Boolean));
+          // delete files from disk
+          (victim.media || []).forEach(m => {
+            if (m && toRemove.has(m.filename)) {
+              const p = path.join(process.cwd(), 'uploads', m.filename);
+              try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+            }
+          });
+          // filter out removed from document
+          victim.media = (victim.media || []).filter(m => !(m && toRemove.has(m.filename)));
+          // keep legacy image consistent
+          if (victim.image && victim.media.every(m => m.url !== victim.image)) {
+            victim.image = victim.media[0]?.url || undefined;
+          }
         }
-      });
-      // filter out removed from document
-      victim.media = victim.media.filter(m => !(m && toRemove.has(m.filename)));
-      // keep legacy image consistent
-      if (victim.image && victim.media.every(m => m.url !== victim.image)) {
-        victim.image = victim.media[0]?.url || undefined;
+      } catch (_) {
+        // ignore malformed remove
       }
     }
-  } catch(_) { /* ignore malformed remove */ }
-}
-
 
     // Append any new uploads
     const newMedia = (req.files || []).map(f => ({
@@ -230,9 +320,24 @@ if (req.body.remove) {
       size: f.size
     }));
     if (newMedia.length) {
-      victim.media.push(...newMedia);
-      // Optionally fill legacy image if empty
-      if (!victim.image) victim.image = newMedia[0].url;
+      victim.media = [...(victim.media || []), ...newMedia];
+      if (!victim.image) victim.image = newMedia[0].url; // legacy convenience
+    }
+
+    // Final server-side validation of the whole document
+    const finalObj = {
+      name: victim.name,
+      phone: victim.phone,
+      nic: victim.nic,
+      status: victim.status,
+      disasterType: victim.disasterType,
+      address: victim.address,
+      email: victim.email,
+      location: victim.location
+    };
+    const errors = validateVictimObject(finalObj);
+    if (Object.keys(errors).length) {
+      return res.status(400).json({ message: 'Validation failed', errors });
     }
 
     await victim.save();
@@ -253,10 +358,18 @@ async function updateLocation(req, res) {
     if (lat === undefined || lng === undefined) {
       return res.status(400).json({ message: 'lat and lng are required' });
     }
+    const nlat = Number(lat);
+    const nlng = Number(lng);
+    if (!Number.isFinite(nlat) || !Number.isFinite(nlng)) {
+      return res.status(400).json({ message: 'lat and lng must be numbers' });
+    }
+    if (nlat < -90 || nlat > 90 || nlng < -180 || nlng > 180) {
+      return res.status(400).json({ message: 'lat/lng out of range' });
+    }
 
     const victim = await Victim.findByIdAndUpdate(
       req.params.id,
-      { location: { type: 'Point', coordinates: [Number(lng), Number(lat)] } },
+      { location: { type: 'Point', coordinates: [nlng, nlat] } },
       { new: true }
     );
 

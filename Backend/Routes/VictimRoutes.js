@@ -1,3 +1,4 @@
+// routes/victims.js
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -14,8 +15,8 @@ if (!fs.existsSync(uploadsDir)) {
 
 /* ---------- Multer config (images + video, max 2 files) ---------- */
 const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadsDir),
-  filename:    (_, file, cb) => {
+  destination: (_req, _file, cb) => cb(null, uploadsDir),
+  filename: (_req, file, cb) => {
     const safe = (file.originalname || 'file')
       .replace(/\s+/g, '_')
       .replace(/[^\w.-]/g, '');
@@ -28,8 +29,12 @@ const ALLOWED = new Set([
   'video/mp4', 'video/quicktime', 'video/webm'
 ]);
 
+// Reject unsupported types with a clear error
 const fileFilter = (_req, file, cb) => {
-  cb(null, ALLOWED.has(file.mimetype));
+  if (ALLOWED.has(file.mimetype)) return cb(null, true);
+  const err = new Error('UNSUPPORTED_FILE_TYPE');
+  err.statusCode = 400;
+  return cb(err);
 };
 
 const upload = multer({
@@ -49,9 +54,28 @@ router.get('/:id', VictimController.getVictimById);
 router.post('/', upload.array('media', 2), VictimController.addVictims);
 router.put('/:id', upload.array('media', 2), VictimController.updateVictim);
 
-// quick live location updates (no files)
+// quick current location updates (no files)
 router.patch('/:id/location', VictimController.updateLocation);
 
 router.delete('/:id', VictimController.deleteVictim);
+
+/* ---------- Multer / upload error handler (scoped to this router) ---------- */
+router.use((err, _req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ message: 'File too large (max 25MB per file)' });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ message: 'Too many files (max 2 attachments)' });
+    }
+    return res.status(400).json({ message: err.message || 'Upload error' });
+  }
+  if (err && err.message === 'UNSUPPORTED_FILE_TYPE') {
+    return res.status(err.statusCode || 400).json({
+      message: 'Unsupported file type. Allowed: JPEG, PNG, WEBP, AVIF, MP4, MOV, WEBM.'
+    });
+  }
+  return next(err);
+});
 
 module.exports = router;
